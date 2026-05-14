@@ -623,7 +623,7 @@ def generate(
             # 6. Append the new token index to the context.
             context.append(next_token)
 
-    # Decode the full context back to a string via itos and return it.
+    
     return "".join(itos[i] for i in context)
 
 
