@@ -141,8 +141,28 @@ def get_dataset(
         stoi          (dict[str, int])
         itos          (dict[int, str])
     """
-    # TODO 1.1: implement
-    raise NotImplementedError
+    os.makedirs(data_root, exist_ok=True)
+
+    data_path = os.path.join(data_root, "input.txt")
+    if not os.path.isfile(data_path):
+        print(f"Downloading TinyShakespeare to {data_path} ...")
+        urllib.request.urlretrieve(DATA_URL, data_path)
+
+    with open(data_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    chars = sorted(set(text))
+    vocab_size = len(chars)
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    itos = {i: ch for i, ch in enumerate(chars)}
+
+    data = torch.tensor([stoi[ch] for ch in text], dtype=torch.long)
+
+    split = int(len(data) * train_frac)
+    train_dataset = CharDataset(data[:split], block_size)
+    val_dataset   = CharDataset(data[split:], block_size)
+
+    return train_dataset, val_dataset, vocab_size, stoi, itos
 
 
 # ---------------------------------------------------------------------------
@@ -186,24 +206,44 @@ class CausalSelfAttention(nn.Module):
         dropout:    float = 0.0,
     ):
         super().__init__()
-        # TODO 1.2 – __init__:
         # assert embed_dim % num_heads == 0
+        assert embed_dim % num_heads == 0
         # store self.num_heads, self.head_dim (= embed_dim // num_heads), self.embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.embed_dim = embed_dim
         # create self.qkv, self.out_proj, self.attn_drop, self.resid_drop
+        self.qkv    = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
         # create the causal mask and register it as a buffer named "mask"
-        raise NotImplementedError
+        mask = torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
+        self.register_buffer("mask", mask)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # TODO 1.2 – forward:
         # 1. Unpack B, T, C from x.shape
+        B, T, C = x.shape
         # 2. Project x through self.qkv and split into q, k, v (each shape (B, T, C))
+        q, k, v = self.qkv(x).split(self.embed_dim, dim=2)  # each (B, T, C)
         # 3. Reshape each to (B, num_heads, T, head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         # 4. Compute scaled dot-product: (q @ k^T) / sqrt(head_dim)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        att = (q @ k.transpose(-2, -1)) * scale          # (B, num_heads, T, T)
         # 5. Apply the causal mask: fill positions where mask == 0 with -inf
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
         # 6. Softmax over the last dimension, then apply self.attn_drop
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
         # 7. Multiply by v, reshape back to (B, T, C)
+        y = att @ v                                       # (B, num_heads, T, head_dim)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
         # 8. Apply self.out_proj and self.resid_drop
-        raise NotImplementedError
+        return self.resid_drop(self.out_proj(y))
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +290,21 @@ class GPTBlock(nn.Module):
     ):
         super().__init__()
         # TODO 1.3 – __init__: create norm1, attn, norm2, mlp
-        raise NotImplementedError
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn  = CausalSelfAttention(embed_dim, num_heads, block_size, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp   = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # TODO 1.3 – forward: apply pre-norm residual connections
-        raise NotImplementedError
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -316,15 +366,29 @@ class GPT(nn.Module):
         super().__init__()
         self.block_size = block_size
         # TODO 1.4 – __init__: create all sub-modules and tie weights
-        raise NotImplementedError
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.pos_embedding   = nn.Embedding(block_size, embed_dim)
+        self.drop            = nn.Dropout(dropout)
+        self.blocks          = nn.ModuleList([
+            GPTBlock(embed_dim, num_heads, block_size, mlp_dim, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.head.weight = self.token_embedding.weight  # weight tying
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        # TODO 1.4 – forward:
         # 1. Unpack B, T; assert T <= self.block_size
+        B, T = idx.shape
+        assert T <= self.block_size, f"sequence length {T} exceeds block_size {self.block_size}"
         # 2. Compute token and position embeddings; add them; apply dropout
+        positions = torch.arange(T, device=idx.device)
+        x = self.drop(self.token_embedding(idx) + self.pos_embedding(positions))
         # 3. Pass through each block in self.blocks
+        for block in self.blocks:
+            x = block(x)
         # 4. Apply self.norm and self.head
-        raise NotImplementedError
+        return self.head(self.norm(x))
 
 
 def build_model(config: dict, vocab_size: int) -> "GPT":
@@ -396,8 +460,107 @@ def train_model(
     -------
     dict : the training log (same as what is written to log_path)
     """
-    # TODO 1.5: implement
-    raise NotImplementedError
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # Optimizer: AdamW, lr = config["lr"], weight_decay = 1e-2
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=1e-2)
+    # LR schedule: CosineAnnealingLR with T_max = config["epochs"]
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
+    total_params = sum(p.numel() for p in model.parameters())
+    history = []
+
+    for epoch in range(1, config["epochs"] + 1):
+        model.train()
+        epoch_start = time.time()
+
+        # Each epoch: sample batches from a shuffled DataLoader until
+        #             config["steps_per_epoch"] gradient steps are done.
+        train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
+        train_iter = iter(train_loader)
+        total_train_loss = 0.0
+
+        for _ in range(config["steps_per_epoch"]):
+            try:
+                x, y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True))
+                x, y = next(train_iter)
+
+            logits = model(x)                       # (B, T, V)
+            B, T, V = logits.shape
+            # Loss: cross-entropy over ALL token positions in the batch
+            #       (flatten logits to (B*T, V) and targets to (B*T,))
+            loss = F.cross_entropy(logits.view(B * T, V), y.view(B * T))
+
+            optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping: torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_train_loss += loss.item()
+
+        train_loss = total_train_loss / config["steps_per_epoch"]
+
+        # Validation: after each epoch, evaluate on up to 50 batches from
+        #             val_dataset (no gradient).
+        model.eval()
+        val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
+        total_val_loss = 0.0
+        val_steps = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                if val_steps >= 50:
+                    break
+                logits = model(x)
+                B, T, V = logits.shape
+                total_val_loss += F.cross_entropy(logits.view(B * T, V), y.view(B * T)).item()
+                val_steps += 1
+        val_loss = total_val_loss / val_steps if val_steps > 0 else 0.0
+
+        scheduler.step()
+
+        epoch_time = time.time() - epoch_start
+        history.append({
+            "epoch": epoch,
+            "train_loss": round(train_loss, 4),
+            "val_loss": round(val_loss, 4),
+            "epoch_time_sec": round(epoch_time, 4),
+        })
+        print(f"Epoch {epoch}/{config['epochs']} | train={train_loss:.4f} | val={val_loss:.4f} | {epoch_time:.1f}s")
+
+        # Checkpoints: save at every epoch in CHECKPOINT_EPOCHS.
+        if epoch in CHECKPOINT_EPOCHS:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "config": {k: config[k] for k in
+                           ["block_size", "embed_dim", "num_heads", "num_layers", "mlp_dim", "dropout"]},
+                "epoch": epoch,
+            }, os.path.join(checkpoint_dir, f"gpt_epoch_{epoch}.pt"))
+
+    # Logging: after all epochs, write training_log.json.
+    log = {
+        "seed": SEED,
+        "config": {
+            "block_size":      config["block_size"],
+            "embed_dim":       config["embed_dim"],
+            "num_heads":       config["num_heads"],
+            "num_layers":      config["num_layers"],
+            "mlp_dim":         config["mlp_dim"],
+            "dropout":         config["dropout"],
+            "lr":              config["lr"],
+            "batch_size":      config["batch_size"],
+            "epochs":          config["epochs"],
+            "steps_per_epoch": config["steps_per_epoch"],
+        },
+        "history": history,
+        "final_val_loss": round(history[-1]["val_loss"], 4),
+        "total_params": total_params,
+    }
+
+    with open(log_path, "w") as f:
+        json.dump(log, f, indent=2)
+
+    return log
 
 
 # ---------------------------------------------------------------------------
@@ -440,8 +603,28 @@ def generate(
     Returns:
         str : full generated text (prompt + new characters)
     """
-    # TODO 1.6: implement
-    raise NotImplementedError
+    model.eval()
+    context = [stoi[ch] for ch in prompt]
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            # 1. Encode the current context to a LongTensor (1, T).
+            #    Crop to the last block_size tokens if T > block_size.
+            ctx = context[-model.block_size:]
+            ctx_tensor = torch.tensor(ctx, dtype=torch.long).unsqueeze(0)  # (1, T)
+            # 2. Forward pass → logits of shape (1, T, vocab_size).
+            logits = model(ctx_tensor)
+            # 3. Take logits for the last position: logits[:, -1, :].
+            logits_last = logits[:, -1, :]
+            # 4. Divide by temperature, then softmax to get probabilities.
+            probs = F.softmax(logits_last / temperature, dim=-1)
+            # 5. Sample one token with torch.multinomial(probs, num_samples=1).
+            next_token = torch.multinomial(probs, num_samples=1).item()
+            # 6. Append the new token index to the context.
+            context.append(next_token)
+
+    # Decode the full context back to a string via itos and return it.
+    return "".join(itos[i] for i in context)
 
 
 # ---------------------------------------------------------------------------
